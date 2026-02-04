@@ -38,6 +38,15 @@
 - Документация Swagger UI: http://127.0.0.1:8000/docs  
 - ReDoc: http://127.0.0.1:8000/redoc  
 
+## Запуск через Docker
+
+```bash
+docker build -t server-time-api .
+docker run -p 8000:8000 server-time-api
+```
+
+API будет доступен по адресу http://localhost:8000
+
 ## Пример ответа GET /time
 
 ```json
