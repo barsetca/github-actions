@@ -48,6 +48,25 @@
 }
 ```
 
+## GitHub Actions (CI/CD)
+
+Workflow `.github/workflows/build-and-deploy.yml` при пуше в ветку `main`:
+
+1. **build-and-push** — собирает Docker-образ и пушит его в GitHub Container Registry (`ghcr.io/<owner>/<repo>`), теги `latest` и по SHA.
+2. **deploy** — по SSH подключается к вашему серверу, логинится в GHCR (если задан токен), тянет образ, перезапускает контейнер `server-time-api` на порту 8000.
+
+### Секреты репозитория (Settings → Secrets and variables → Actions)
+
+| Секрет | Описание |
+|--------|----------|
+| `SSH_HOST` | Хост или IP сервера |
+| `SSH_USER` | Имя пользователя SSH |
+| `SSH_PRIVATE_KEY` | Приватный SSH-ключ (содержимое целиком) |
+| `SSH_PORT` | Порт SSH (например `22`) |
+| `GHCR_TOKEN` | *(опционально)* Personal Access Token с правом `read:packages` — для pull приватного образа с сервера. Для публичного пакета можно не задавать. |
+
+На сервере должен быть установлен Docker; пользователь `SSH_USER` должен иметь право запускать `docker` без sudo (например, в группе `docker`).
+
 ## Лицензия
 
 MIT
