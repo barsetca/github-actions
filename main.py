@@ -1,15 +1,23 @@
 """
 Простой тестовый бэкенд на FastAPI.
 Возвращает текущее время сервера и конвертирует время по названию города (в т.ч. на русском).
+Логи отправляются в Loki для сбора.
 """
 
+import asyncio
+import json
+import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
+
+# Loki Push API: POST http://<host>:3100/loki/api/v1/push
+LOKI_URL = os.getenv("LOKI_URL", "http://79.174.81.159:3100/loki/api/v1/push")
 
 app = FastAPI(
     title="Server Time API",
@@ -29,6 +37,42 @@ UTC_TIME_ONLY_FORMATS = ("%H:%M:%S", "%H:%M")  # только время — п�
 # Геокодер для названия города → координаты (поддерживает русские названия)
 _geolocator = Nominatim(user_agent="ServerTimeAPI/1.0")
 _tzf = TimezoneFinder()
+
+
+async def send_log_to_loki(
+    message: str,
+    endpoint: str = "",
+    level: str = "info",
+    **labels: str,
+) -> None:
+    """
+    Отправляет лог в Loki (POST http://<host>:3100/loki/api/v1/push).
+    Формат: streams[].stream — лейблы (job, level, env, …), values — пары [timestamp_ns, line].
+    Не прерывает работу приложения при недоступности Loki.
+    """
+    try:
+        # наносекунды с эпохи Unix (строка)
+        ts_nano = str(int(datetime.now(timezone.utc).timestamp() * 1e9))
+        stream_labels: dict[str, str] = {
+            "job": "server-time-api",
+            "level": level,
+            "endpoint": endpoint or "/",
+        }
+        if os.getenv("ENV"):
+            stream_labels["env"] = os.getenv("ENV", "")
+        stream_labels.update(labels)
+        payload = {
+            "streams": [
+                {
+                    "stream": stream_labels,
+                    "values": [[ts_nano, message]],
+                }
+            ]
+        }
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(LOKI_URL, json=payload)
+    except Exception:
+        pass
 
 
 def _city_to_timezone(city_name: str) -> str:
@@ -57,18 +101,48 @@ def _city_to_timezone(city_name: str) -> str:
 @app.get("/")
 async def root():
     """Корневой эндпоинт с приветствием."""
-    return {"message": "Server Time API", "docs": "/docs"}
+    response = {"message": "Server Time API", "docs": "/docs"}
+    asyncio.create_task(
+        send_log_to_loki(
+            json.dumps(
+                {
+                    "method": "GET",
+                    "path": "/",
+                    "status": "ok",
+                    "response": response,
+                },
+                ensure_ascii=False,
+            ),
+            endpoint="/",
+        )
+    )
+    return response
 
 
 @app.get("/time")
 async def get_server_time():
     """Возвращает текущее время сервера в UTC (ISO 8601)."""
     now = datetime.now(timezone.utc)
-    return {
+    response = {
         "server_time": now.isoformat(),
         "timestamp": now.timestamp(),
         "timezone": "UTC",
     }
+    asyncio.create_task(
+        send_log_to_loki(
+            json.dumps(
+                {
+                    "method": "GET",
+                    "path": "/time",
+                    "status": "ok",
+                    "response": response,
+                },
+                ensure_ascii=False,
+            ),
+            endpoint="/time",
+        )
+    )
+    return response
 
 
 def _parse_utc_time(value: str) -> datetime:
@@ -108,25 +182,80 @@ async def convert_time(
     Город можно вводить по-русски (Екатеринбург, Москва) или по-английски.
     Время UTC можно передать строкой; если не передано — используется текущее время.
     """
-    if utc_time is None or utc_time.strip() == "":
-        dt_utc = datetime.now(timezone.utc)
-    else:
-        dt_utc = _parse_utc_time(utc_time)
+    try:
+        if utc_time is None or utc_time.strip() == "":
+            dt_utc = datetime.now(timezone.utc)
+        else:
+            dt_utc = _parse_utc_time(utc_time)
 
-    tz_name = _city_to_timezone(city)
-    tz = ZoneInfo(tz_name)
-    dt_local = dt_utc.astimezone(tz)
+        tz_name = _city_to_timezone(city)
+        tz = ZoneInfo(tz_name)
+        dt_local = dt_utc.astimezone(tz)
 
-    return {
-        "utc_time": dt_utc.isoformat(),
-        "city": city.strip(),
-        "timezone": tz_name,
-        "converted_time": dt_local.isoformat(),
-        "converted_time_local": dt_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
-    }
+        response = {
+            "utc_time": dt_utc.isoformat(),
+            "city": city.strip(),
+            "timezone": tz_name,
+            "converted_time": dt_local.isoformat(),
+            "converted_time_local": dt_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        }
+        asyncio.create_task(
+            send_log_to_loki(
+                json.dumps(
+                    {
+                        "method": "GET",
+                        "path": "/time/convert",
+                        "status": "ok",
+                        "request": {"city": city.strip(), "utc_time": utc_time or "(current)"},
+                        "response": response,
+                    },
+                    ensure_ascii=False,
+                ),
+                endpoint="/time/convert",
+                city=city.strip(),
+                timezone=tz_name,
+            )
+        )
+        return response
+    except HTTPException as e:
+        asyncio.create_task(
+            send_log_to_loki(
+                json.dumps(
+                    {
+                        "method": "GET",
+                        "path": "/time/convert",
+                        "status": "error",
+                        "status_code": e.status_code,
+                        "detail": e.detail,
+                        "request": {"city": city.strip(), "utc_time": utc_time or "(current)"},
+                    },
+                    ensure_ascii=False,
+                ),
+                endpoint="/time/convert",
+                level="error",
+                city=city.strip(),
+                status_code=str(e.status_code),
+            )
+        )
+        raise
 
 
 @app.get("/health")
 async def health():
     """Эндпоинт для проверки работоспособности сервиса."""
-    return {"status": "ok"}
+    response = {"status": "ok"}
+    asyncio.create_task(
+        send_log_to_loki(
+            json.dumps(
+                {
+                    "method": "GET",
+                    "path": "/health",
+                    "status": "ok",
+                    "response": response,
+                },
+                ensure_ascii=False,
+            ),
+            endpoint="/health",
+        )
+    )
+    return response
